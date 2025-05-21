@@ -28,6 +28,7 @@ type copts struct {
 	repos           []string
 	serviceaccounts []string
 	name            string
+	patchAllSAs     bool
 
 	flags *genericclioptions.ConfigFlags
 	genericiooptions.IOStreams
@@ -53,7 +54,11 @@ Create a secret appropriate for pulling all images from "cgr.dev" and "gcr.io"
 
 Create a secret in the "foo" namespace that all the default service accounts in the "foo" namespace can pull images from "cgr.dev"
 
-	kubectl crane --repo cgr.dev --sa default --namespace foo`,
+	kubectl crane --repo cgr.dev --sa default --namespace foo
+
+Create a secret in the "foo" namespace and patch it to all service accounts in that namespace
+
+	kubectl crane --repo cgr.dev --namespace foo --patch-all-sa`,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return o.Run(cmd)
@@ -65,6 +70,7 @@ Create a secret in the "foo" namespace that all the default service accounts in 
 	cmd.Flags().StringSliceVar(&o.refs, "ref", []string{}, "The image reference to create the secret for. The repository will be inferred.")
 	cmd.Flags().StringSliceVarP(&o.repos, "repo", "r", []string{}, "The repository to create the secret for")
 	cmd.Flags().StringSliceVar(&o.serviceaccounts, "sa", []string{}, "The service account to patch.")
+	cmd.Flags().BoolVar(&o.patchAllSAs, "patch-all-sa", false, "Patch all service accounts in the namespace with the image pull secret.")
 
 	return cmd
 }
@@ -155,44 +161,73 @@ func (o *copts) Run(cmd *cobra.Command) error {
 		return fmt.Errorf("checking for existing secret: %w", err)
 	}
 
-	// for each service account, patch it with the imagePullSecret
-	for _, sa := range o.serviceaccounts {
-		obj, err := kcli.CoreV1().ServiceAccounts(secret.Namespace).Get(ctx, sa, v1.GetOptions{})
+	// Check if we should patch all service accounts in the namespace
+	if o.patchAllSAs {
+		// List all service accounts in the namespace
+		saList, err := kcli.CoreV1().ServiceAccounts(secret.Namespace).List(ctx, v1.ListOptions{})
 		if err != nil {
-			if errors.IsNotFound(err) {
-				// Create the service account if it doesn't exist
-				newSA := &corev1.ServiceAccount{
-					ObjectMeta: v1.ObjectMeta{
-						Name:      sa,
-						Namespace: secret.Namespace,
-					},
-					ImagePullSecrets: []corev1.LocalObjectReference{{Name: sobj.Name}},
+			return fmt.Errorf("listing service accounts in namespace '%s': %w", secret.Namespace, err)
+		}
+		
+		for _, sa := range saList.Items {
+			// Check if the imagePullSecret is already in the service account
+			found := false
+			for _, ips := range sa.ImagePullSecrets {
+				if ips.Name == sobj.Name {
+					found = true
+					break
 				}
-				_, err = kcli.CoreV1().ServiceAccounts(secret.Namespace).Create(ctx, newSA, v1.CreateOptions{})
+			}
+			if !found {
+				sa.ImagePullSecrets = append(sa.ImagePullSecrets, corev1.LocalObjectReference{Name: sobj.Name})
+				_, err = kcli.CoreV1().ServiceAccounts(secret.Namespace).Update(ctx, &sa, v1.UpdateOptions{})
 				if err != nil {
-					return fmt.Errorf("creating service account '%s': %w", sa, err)
+					return fmt.Errorf("updating service account '%s': %w", sa.Name, err)
 				}
-				log.Infof("created service account '%s'", sa)
-				continue
-			}
-			return fmt.Errorf("getting service account '%s': %w", sa, err)
-		}
-
-		// Check if the imagePullSecret is already in the service account
-		found := false
-		for _, ips := range obj.ImagePullSecrets {
-			if ips.Name == secret.Name {
-				found = true
-				break
+				log.Infof("patched service account '%s' with imagePullSecret '%s'", sa.Name, sobj.Name)
 			}
 		}
-		if !found {
-			obj.ImagePullSecrets = append(obj.ImagePullSecrets, corev1.LocalObjectReference{Name: sobj.Name})
-			_, err = kcli.CoreV1().ServiceAccounts(secret.Namespace).Update(ctx, obj, v1.UpdateOptions{})
+		log.Infof("patched all service accounts in namespace '%s' with imagePullSecret '%s'", secret.Namespace, sobj.Name)
+	} else if len(o.serviceaccounts) > 0 {
+		// For each specified service account, patch it with the imagePullSecret
+		for _, sa := range o.serviceaccounts {
+			obj, err := kcli.CoreV1().ServiceAccounts(secret.Namespace).Get(ctx, sa, v1.GetOptions{})
 			if err != nil {
-				return fmt.Errorf("updating service account '%s': %w", sa, err)
+				if errors.IsNotFound(err) {
+					// Create the service account if it doesn't exist
+					newSA := &corev1.ServiceAccount{
+						ObjectMeta: v1.ObjectMeta{
+							Name:      sa,
+							Namespace: secret.Namespace,
+						},
+						ImagePullSecrets: []corev1.LocalObjectReference{{Name: sobj.Name}},
+					}
+					_, err = kcli.CoreV1().ServiceAccounts(secret.Namespace).Create(ctx, newSA, v1.CreateOptions{})
+					if err != nil {
+						return fmt.Errorf("creating service account '%s': %w", sa, err)
+					}
+					log.Infof("created service account '%s'", sa)
+					continue
+				}
+				return fmt.Errorf("getting service account '%s': %w", sa, err)
 			}
-			log.Infof("patched service account '%s' with imagePullSecret '%s'", sa, secret.Name)
+
+			// Check if the imagePullSecret is already in the service account
+			found := false
+			for _, ips := range obj.ImagePullSecrets {
+				if ips.Name == sobj.Name {
+					found = true
+					break
+				}
+			}
+			if !found {
+				obj.ImagePullSecrets = append(obj.ImagePullSecrets, corev1.LocalObjectReference{Name: sobj.Name})
+				_, err = kcli.CoreV1().ServiceAccounts(secret.Namespace).Update(ctx, obj, v1.UpdateOptions{})
+				if err != nil {
+					return fmt.Errorf("updating service account '%s': %w", sa, err)
+				}
+				log.Infof("patched service account '%s' with imagePullSecret '%s'", sa, sobj.Name)
+			}
 		}
 	}
 
