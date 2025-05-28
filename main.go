@@ -89,12 +89,66 @@ func (o *copts) Run(cmd *cobra.Command) error {
 	ctx := cmd.Context()
 	log := clog.FromContext(ctx)
 
+	// Validate flags
+	if err := o.validateFlags(); err != nil {
+		return err
+	}
+
+	// Build registry configurations
+	repos, err := o.buildRegistryConfigs(*log)
+	if err != nil {
+		return err
+	}
+
+	// Create docker config
+	dcfg, err := o.createDockerConfig(repos)
+	if err != nil {
+		return err
+	}
+
+	// Create secret object
+	secret, err := o.secret(dcfg)
+	if err != nil {
+		return fmt.Errorf("creating secret: %w", err)
+	}
+
+	// Get Kubernetes client
+	kcli, err := o.getKubernetesClient()
+	if err != nil {
+		return err
+	}
+
+	// Create or update the main secret
+	sobj, err := o.createOrUpdateSecret(ctx, kcli, secret, *log)
+	if err != nil {
+		return err
+	}
+
+	// Patch service accounts based on flags
+	return o.patchServiceAccounts(ctx, kcli, sobj, *log)
+}
+
+// validateFlags validates the command line flags
+func (o *copts) validateFlags() error {
+	if len(o.refs) == 0 && len(o.repos) == 0 {
+		return fmt.Errorf("at least one --ref or --repo must be specified")
+	}
+
+	if o.patchAllNamespaces && *o.flags.Namespace != "" && *o.flags.Namespace != "default" {
+		return fmt.Errorf("--patch-all-namespaces cannot be used with a specific --namespace")
+	}
+
+	return nil
+}
+
+// buildRegistryConfigs builds registry configurations from refs and repos
+func (o *copts) buildRegistryConfigs(log clog.Logger) (map[string]name.Registry, error) {
 	repos := make(map[string]name.Registry)
 
 	for _, repo := range o.repos {
 		r, err := name.NewRegistry(repo)
 		if err != nil {
-			return fmt.Errorf("parsing repository: %w", err)
+			return nil, fmt.Errorf("parsing repository: %w", err)
 		}
 		log.Infof("registering repo %s", r.RegistryStr())
 		repos[r.RegistryStr()] = r
@@ -103,12 +157,17 @@ func (o *copts) Run(cmd *cobra.Command) error {
 	for _, ref := range o.refs {
 		r, err := name.ParseReference(ref)
 		if err != nil {
-			return fmt.Errorf("parsing repository: %w", err)
+			return nil, fmt.Errorf("parsing repository: %w", err)
 		}
 		log.Infof("registering repo %s inferred from reference %s", r.Context().RegistryStr(), r.String())
 		repos[r.Context().RegistryStr()] = r.Context().Registry
 	}
 
+	return repos, nil
+}
+
+// createDockerConfig creates docker configuration from registry configs
+func (o *copts) createDockerConfig(repos map[string]name.Registry) (configfile.ConfigFile, error) {
 	dcfg := configfile.ConfigFile{
 		AuthConfigs: map[string]types.AuthConfig{},
 	}
@@ -116,12 +175,12 @@ func (o *copts) Run(cmd *cobra.Command) error {
 	for name, repo := range repos {
 		a, err := authn.DefaultKeychain.Resolve(repo)
 		if err != nil {
-			return err
+			return dcfg, fmt.Errorf("resolving auth for %s: %w", name, err)
 		}
 
 		cfg, err := a.Authorization()
 		if err != nil {
-			return err
+			return dcfg, fmt.Errorf("getting authorization for %s: %w", name, err)
 		}
 
 		dcfg.AuthConfigs[name] = types.AuthConfig{
@@ -131,246 +190,226 @@ func (o *copts) Run(cmd *cobra.Command) error {
 		}
 	}
 
-	secret, err := o.secret(dcfg)
-	if err != nil {
-		return fmt.Errorf("creating secret: %w", err)
-	}
+	return dcfg, nil
+}
 
-	log.Infof("creating secret '%s/%s'", secret.Name, secret.Namespace)
-
+// getKubernetesClient creates a kubernetes client
+func (o *copts) getKubernetesClient() (*kubernetes.Clientset, error) {
 	rcfg, err := o.flags.ToRESTConfig()
 	if err != nil {
-		return fmt.Errorf("getting REST config: %w", err)
+		return nil, fmt.Errorf("getting REST config: %w", err)
 	}
 
 	kcli, err := kubernetes.NewForConfig(rcfg)
 	if err != nil {
-		return fmt.Errorf("creating kubernetes client: %w", err)
+		return nil, fmt.Errorf("creating kubernetes client: %w", err)
 	}
 
-	var sobj *corev1.Secret
+	return kcli, nil
+}
 
-	sobj, err = kcli.CoreV1().Secrets(secret.Namespace).Get(ctx, secret.Name, v1.GetOptions{})
+// createOrUpdateSecret creates or updates the main secret
+func (o *copts) createOrUpdateSecret(ctx context.Context, kcli *kubernetes.Clientset, secret *corev1.Secret, log clog.Logger) (*corev1.Secret, error) {
+	log.Infof("managing secret '%s/%s'", secret.Namespace, secret.Name)
+
+	sobj, err := kcli.CoreV1().Secrets(secret.Namespace).Get(ctx, secret.Name, v1.GetOptions{})
 	if err == nil {
-		// update it
+		// Update existing secret
 		sobj, err = kcli.CoreV1().Secrets(secret.Namespace).Update(ctx, secret, v1.UpdateOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("updating secret: %w", err)
+		}
+		log.Infof("updated secret '%s/%s'", secret.Namespace, secret.Name)
+	} else if errors.IsNotFound(err) {
+		// Create new secret
+		sobj, err = kcli.CoreV1().Secrets(secret.Namespace).Create(ctx, secret, v1.CreateOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("creating secret: %w", err)
+		}
+		log.Infof("created secret '%s/%s'", secret.Namespace, secret.Name)
+	} else {
+		return nil, fmt.Errorf("checking for existing secret: %w", err)
+	}
+
+	return sobj, nil
+}
+
+// patchServiceAccounts patches service accounts based on flags
+func (o *copts) patchServiceAccounts(ctx context.Context, kcli *kubernetes.Clientset, secret *corev1.Secret, log clog.Logger) error {
+	if o.patchAllNamespaces {
+		return o.patchAllNamespacesFunc(ctx, kcli, secret, log)
+	} else if o.patchAllSAs {
+		return o.patchAllServiceAccountsInNamespace(ctx, kcli, secret.Namespace, secret.Name, log)
+	} else if len(o.serviceaccounts) > 0 {
+		return o.patchSpecificServiceAccounts(ctx, kcli, secret.Namespace, secret.Name, o.serviceaccounts, log)
+	}
+
+	return nil
+}
+
+// patchAllNamespacesFunc patches service accounts across all namespaces
+func (o *copts) patchAllNamespacesFunc(ctx context.Context, kcli *kubernetes.Clientset, secret *corev1.Secret, log clog.Logger) error {
+	// List all namespaces
+	nsList, err := kcli.CoreV1().Namespaces().List(ctx, v1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("listing namespaces: %w", err)
+	}
+
+	log.Infof("patching service accounts across all namespaces with imagePullSecret '%s'", secret.Name)
+
+	for _, ns := range nsList.Items {
+		// Skip system namespaces
+		if isSystemNamespace(ns.Name) {
+			log.Infof("skipping system namespace '%s'", ns.Name)
+			continue
+		}
+
+		// Create/update secret in namespace
+		if err := o.ensureSecretInNamespace(ctx, kcli, ns.Name, secret, log); err != nil {
+			log.Infof("failed to ensure secret in namespace '%s': %v", ns.Name, err)
+			continue
+		}
+
+		// Patch service accounts in namespace
+		if o.patchAllSAs {
+			if err := o.patchAllServiceAccountsInNamespace(ctx, kcli, ns.Name, secret.Name, log); err != nil {
+				log.Infof("failed to patch all service accounts in namespace '%s': %v", ns.Name, err)
+			}
+		} else if len(o.serviceaccounts) > 0 {
+			if err := o.patchSpecificServiceAccounts(ctx, kcli, ns.Name, secret.Name, o.serviceaccounts, log); err != nil {
+				log.Infof("failed to patch specific service accounts in namespace '%s': %v", ns.Name, err)
+			}
+		}
+	}
+
+	log.Infof("finished patching service accounts across all namespaces")
+	return nil
+}
+
+// ensureSecretInNamespace ensures a secret exists in a namespace
+func (o *copts) ensureSecretInNamespace(ctx context.Context, kcli *kubernetes.Clientset, namespace string, secret *corev1.Secret, log clog.Logger) error {
+	nsSecret := &corev1.Secret{
+		ObjectMeta: v1.ObjectMeta{
+			Name:      secret.Name,
+			Namespace: namespace,
+		},
+		Type: corev1.SecretTypeDockerConfigJson,
+		Data: secret.Data,
+	}
+
+	_, err := kcli.CoreV1().Secrets(namespace).Get(ctx, secret.Name, v1.GetOptions{})
+	if err != nil {
+		if errors.IsNotFound(err) {
+			// Create the secret
+			_, err = kcli.CoreV1().Secrets(namespace).Create(ctx, nsSecret, v1.CreateOptions{})
+			if err != nil {
+				return fmt.Errorf("creating secret: %w", err)
+			}
+			log.Infof("created secret '%s' in namespace '%s'", secret.Name, namespace)
+		} else {
+			return fmt.Errorf("checking for secret: %w", err)
+		}
+	} else {
+		// Update the secret
+		_, err = kcli.CoreV1().Secrets(namespace).Update(ctx, nsSecret, v1.UpdateOptions{})
 		if err != nil {
 			return fmt.Errorf("updating secret: %w", err)
 		}
-		log.Infof("updated secret '%s/%s'", secret.Name, secret.Namespace)
-
-	} else if errors.IsNotFound(err) {
-		// create it
-		sobj, err = kcli.CoreV1().Secrets(secret.Namespace).Create(ctx, secret, v1.CreateOptions{})
-		if err != nil {
-			return fmt.Errorf("creating secret: %w", err)
-		}
-		log.Infof("created secret '%s/%s'", secret.Name, secret.Namespace)
-
-	} else {
-		return fmt.Errorf("checking for existing secret: %w", err)
+		log.Infof("updated secret '%s' in namespace '%s'", secret.Name, namespace)
 	}
 
-	// Check if we should patch service accounts across all namespaces
-	if o.patchAllNamespaces {
-		// List all namespaces
-		nsList, err := kcli.CoreV1().Namespaces().List(ctx, v1.ListOptions{})
-		if err != nil {
-			return fmt.Errorf("listing namespaces: %w", err)
-		}
-		
-		log.Infof("patching service accounts across all namespaces with imagePullSecret '%s'", sobj.Name)
-		
-		for _, ns := range nsList.Items {
-			// Skip the kube-system namespace and other system namespaces for safety
-			if ns.Name == "kube-system" || ns.Name == "kube-public" || ns.Name == "kube-node-lease" {
-				log.Infof("skipping system namespace '%s'", ns.Name)
-				continue
-			}
-			
-			// Create a secret in each namespace if it doesn't exist
-			nsSecret := &corev1.Secret{
-				ObjectMeta: v1.ObjectMeta{
-					Name:      sobj.Name,
-					Namespace: ns.Name,
-				},
-				Type: corev1.SecretTypeDockerConfigJson,
-				Data: sobj.Data,
-			}
-			
-			_, err = kcli.CoreV1().Secrets(ns.Name).Get(ctx, sobj.Name, v1.GetOptions{})
-			if err != nil {
-				if errors.IsNotFound(err) {
-					// Create the secret in this namespace
-					_, err = kcli.CoreV1().Secrets(ns.Name).Create(ctx, nsSecret, v1.CreateOptions{})
-					if err != nil {
-						log.Infof("failed to create secret in namespace '%s': %v", ns.Name, err)
-						continue
-					}
-					log.Infof("created secret '%s' in namespace '%s'", sobj.Name, ns.Name)
-				} else {
-					log.Infof("error checking for secret in namespace '%s': %v", ns.Name, err)
-					continue
-				}
-			} else {
-				// Update the secret in this namespace
-				_, err = kcli.CoreV1().Secrets(ns.Name).Update(ctx, nsSecret, v1.UpdateOptions{})
-				if err != nil {
-					log.Infof("failed to update secret in namespace '%s': %v", ns.Name, err)
-					continue
-				}
-				log.Infof("updated secret '%s' in namespace '%s'", sobj.Name, ns.Name)
-			}
-			
-			// If patchAllSAs is also set, patch all service accounts in this namespace
-			if o.patchAllSAs {
-				// List all service accounts in the namespace
-				saList, err := kcli.CoreV1().ServiceAccounts(ns.Name).List(ctx, v1.ListOptions{})
-				if err != nil {
-					log.Infof("failed to list service accounts in namespace '%s': %v", ns.Name, err)
-					continue
-				}
-				
-				for _, sa := range saList.Items {
-					// Check if the imagePullSecret is already in the service account
-					found := false
-					for _, ips := range sa.ImagePullSecrets {
-						if ips.Name == sobj.Name {
-							found = true
-							break
-						}
-					}
-					if !found {
-						sa.ImagePullSecrets = append(sa.ImagePullSecrets, corev1.LocalObjectReference{Name: sobj.Name})
-						_, err = kcli.CoreV1().ServiceAccounts(ns.Name).Update(ctx, &sa, v1.UpdateOptions{})
-						if err != nil {
-							log.Infof("failed to update service account '%s' in namespace '%s': %v", sa.Name, ns.Name, err)
-							continue
-						}
-						log.Infof("patched service account '%s' in namespace '%s' with imagePullSecret '%s'", sa.Name, ns.Name, sobj.Name)
-					}
-				}
-				log.Infof("patched all service accounts in namespace '%s' with imagePullSecret '%s'", ns.Name, sobj.Name)
-			} else if len(o.serviceaccounts) > 0 {
-				// For each specified service account, patch it in this namespace
-				for _, saName := range o.serviceaccounts {
-					sa, err := kcli.CoreV1().ServiceAccounts(ns.Name).Get(ctx, saName, v1.GetOptions{})
-					if err != nil {
-						if errors.IsNotFound(err) {
-							// Create the service account if it doesn't exist
-							newSA := &corev1.ServiceAccount{
-								ObjectMeta: v1.ObjectMeta{
-									Name:      saName,
-									Namespace: ns.Name,
-								},
-								ImagePullSecrets: []corev1.LocalObjectReference{{Name: sobj.Name}},
-							}
-							_, err = kcli.CoreV1().ServiceAccounts(ns.Name).Create(ctx, newSA, v1.CreateOptions{})
-							if err != nil {
-								log.Infof("failed to create service account '%s' in namespace '%s': %v", saName, ns.Name, err)
-								continue
-							}
-							log.Infof("created service account '%s' in namespace '%s'", saName, ns.Name)
-							continue
-						}
-						log.Infof("failed to get service account '%s' in namespace '%s': %v", saName, ns.Name, err)
-						continue
-					}
-					
-					// Check if the imagePullSecret is already in the service account
-					found := false
-					for _, ips := range sa.ImagePullSecrets {
-						if ips.Name == sobj.Name {
-							found = true
-							break
-						}
-					}
-					if !found {
-						sa.ImagePullSecrets = append(sa.ImagePullSecrets, corev1.LocalObjectReference{Name: sobj.Name})
-						_, err = kcli.CoreV1().ServiceAccounts(ns.Name).Update(ctx, sa, v1.UpdateOptions{})
-						if err != nil {
-							log.Infof("failed to update service account '%s' in namespace '%s': %v", saName, ns.Name, err)
-							continue
-						}
-						log.Infof("patched service account '%s' in namespace '%s' with imagePullSecret '%s'", saName, ns.Name, sobj.Name)
-					}
-				}
-			}
-		}
-		
-		log.Infof("finished patching service accounts across all namespaces")
-	
-	// Check if we should patch all service accounts in the current namespace
-	} else if o.patchAllSAs {
-		// List all service accounts in the namespace
-		saList, err := kcli.CoreV1().ServiceAccounts(secret.Namespace).List(ctx, v1.ListOptions{})
-		if err != nil {
-			return fmt.Errorf("listing service accounts in namespace '%s': %w", secret.Namespace, err)
-		}
-		
-		for _, sa := range saList.Items {
-			// Check if the imagePullSecret is already in the service account
-			found := false
-			for _, ips := range sa.ImagePullSecrets {
-				if ips.Name == sobj.Name {
-					found = true
-					break
-				}
-			}
-			if !found {
-				sa.ImagePullSecrets = append(sa.ImagePullSecrets, corev1.LocalObjectReference{Name: sobj.Name})
-				_, err = kcli.CoreV1().ServiceAccounts(secret.Namespace).Update(ctx, &sa, v1.UpdateOptions{})
-				if err != nil {
-					return fmt.Errorf("updating service account '%s': %w", sa.Name, err)
-				}
-				log.Infof("patched service account '%s' with imagePullSecret '%s'", sa.Name, sobj.Name)
-			}
-		}
-		log.Infof("patched all service accounts in namespace '%s' with imagePullSecret '%s'", secret.Namespace, sobj.Name)
-	} else if len(o.serviceaccounts) > 0 {
-		// For each specified service account, patch it with the imagePullSecret
-		for _, sa := range o.serviceaccounts {
-			obj, err := kcli.CoreV1().ServiceAccounts(secret.Namespace).Get(ctx, sa, v1.GetOptions{})
-			if err != nil {
-				if errors.IsNotFound(err) {
-					// Create the service account if it doesn't exist
-					newSA := &corev1.ServiceAccount{
-						ObjectMeta: v1.ObjectMeta{
-							Name:      sa,
-							Namespace: secret.Namespace,
-						},
-						ImagePullSecrets: []corev1.LocalObjectReference{{Name: sobj.Name}},
-					}
-					_, err = kcli.CoreV1().ServiceAccounts(secret.Namespace).Create(ctx, newSA, v1.CreateOptions{})
-					if err != nil {
-						return fmt.Errorf("creating service account '%s': %w", sa, err)
-					}
-					log.Infof("created service account '%s'", sa)
-					continue
-				}
-				return fmt.Errorf("getting service account '%s': %w", sa, err)
-			}
+	return nil
+}
 
-			// Check if the imagePullSecret is already in the service account
-			found := false
-			for _, ips := range obj.ImagePullSecrets {
-				if ips.Name == sobj.Name {
-					found = true
-					break
-				}
-			}
-			if !found {
-				obj.ImagePullSecrets = append(obj.ImagePullSecrets, corev1.LocalObjectReference{Name: sobj.Name})
-				_, err = kcli.CoreV1().ServiceAccounts(secret.Namespace).Update(ctx, obj, v1.UpdateOptions{})
-				if err != nil {
-					return fmt.Errorf("updating service account '%s': %w", sa, err)
-				}
-				log.Infof("patched service account '%s' with imagePullSecret '%s'", sa, sobj.Name)
-			}
+// patchAllServiceAccountsInNamespace patches all service accounts in a namespace
+func (o *copts) patchAllServiceAccountsInNamespace(ctx context.Context, kcli *kubernetes.Clientset, namespace, secretName string, log clog.Logger) error {
+	saList, err := kcli.CoreV1().ServiceAccounts(namespace).List(ctx, v1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("listing service accounts: %w", err)
+	}
+
+	for _, sa := range saList.Items {
+		if err := o.patchServiceAccount(ctx, kcli, namespace, sa.Name, secretName, log); err != nil {
+			log.Infof("failed to patch service account '%s' in namespace '%s': %v", sa.Name, namespace, err)
+		}
+	}
+
+	log.Infof("patched all service accounts in namespace '%s' with imagePullSecret '%s'", namespace, secretName)
+	return nil
+}
+
+// patchSpecificServiceAccounts patches specific service accounts
+func (o *copts) patchSpecificServiceAccounts(ctx context.Context, kcli *kubernetes.Clientset, namespace, secretName string, serviceAccounts []string, log clog.Logger) error {
+	for _, saName := range serviceAccounts {
+		if err := o.ensureServiceAccountWithSecret(ctx, kcli, namespace, saName, secretName, log); err != nil {
+			return err
 		}
 	}
 
 	return nil
+}
+
+// ensureServiceAccountWithSecret ensures a service account exists and has the secret
+func (o *copts) ensureServiceAccountWithSecret(ctx context.Context, kcli *kubernetes.Clientset, namespace, saName, secretName string, log clog.Logger) error {
+	_, err := kcli.CoreV1().ServiceAccounts(namespace).Get(ctx, saName, v1.GetOptions{})
+	if err != nil {
+		if errors.IsNotFound(err) {
+			// Create the service account
+			newSA := &corev1.ServiceAccount{
+				ObjectMeta: v1.ObjectMeta{
+					Name:      saName,
+					Namespace: namespace,
+				},
+				ImagePullSecrets: []corev1.LocalObjectReference{{Name: secretName}},
+			}
+			_, err = kcli.CoreV1().ServiceAccounts(namespace).Create(ctx, newSA, v1.CreateOptions{})
+			if err != nil {
+				return fmt.Errorf("creating service account '%s': %w", saName, err)
+			}
+			log.Infof("created service account '%s' in namespace '%s'", saName, namespace)
+			return nil
+		}
+		return fmt.Errorf("getting service account '%s': %w", saName, err)
+	}
+
+	return o.patchServiceAccount(ctx, kcli, namespace, saName, secretName, log)
+}
+
+// patchServiceAccount patches a single service account with the secret
+func (o *copts) patchServiceAccount(ctx context.Context, kcli *kubernetes.Clientset, namespace, saName, secretName string, log clog.Logger) error {
+	serviceAccount, err := kcli.CoreV1().ServiceAccounts(namespace).Get(ctx, saName, v1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("getting service account: %w", err)
+	}
+
+	// Check if the imagePullSecret is already present
+	for _, ips := range serviceAccount.ImagePullSecrets {
+		if ips.Name == secretName {
+			// Already has the secret
+			return nil
+		}
+	}
+
+	// Add the secret
+	serviceAccount.ImagePullSecrets = append(serviceAccount.ImagePullSecrets, corev1.LocalObjectReference{Name: secretName})
+	_, err = kcli.CoreV1().ServiceAccounts(namespace).Update(ctx, serviceAccount, v1.UpdateOptions{})
+	if err != nil {
+		return fmt.Errorf("updating service account: %w", err)
+	}
+
+	log.Infof("patched service account '%s' in namespace '%s' with imagePullSecret '%s'", saName, namespace, secretName)
+	return nil
+}
+
+// isSystemNamespace checks if a namespace is a system namespace
+func isSystemNamespace(namespace string) bool {
+	systemNamespaces := []string{"kube-system", "kube-public", "kube-node-lease"}
+	for _, ns := range systemNamespaces {
+		if namespace == ns {
+			return true
+		}
+	}
+	return false
 }
 
 func main() {
@@ -405,7 +444,7 @@ func (o *copts) secret(dockerconfig configfile.ConfigFile) (*corev1.Secret, erro
 
 	return &corev1.Secret{
 		ObjectMeta: v1.ObjectMeta{
-			Name:      "kc",
+			Name:      o.name,
 			Namespace: ns,
 		},
 		Type: corev1.SecretTypeDockerConfigJson,
